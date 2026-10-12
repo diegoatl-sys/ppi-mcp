@@ -32,17 +32,24 @@ from ppi_api import PPIClient, PPIError, extraer_precio
 PLAZO_DEFAULT = "A-24HS"
 MAX_ESPECIES = 30
 MAX_FILAS_HISTORICO = 400
+MAX_RESULTADOS_BUSQUEDA = 25
 
 INSTRUCCIONES = f"""\
 Conector de solo lectura a la API de PPI (Portfolio Personal Inversiones, Argentina).
 Sirve para verificar precios de acciones, bonos, ONs, letras y CEDEARs del mercado argentino.
 
 - Cada especie se identifica con ticker + tipo de instrumento + plazo de liquidación.
-- Plazo por defecto: {PLAZO_DEFAULT}. Si PPI rechaza un tipo o un plazo, llamá a
-  `valores_validos` y reintentá con los valores exactos que devuelve.
-- Bonos en dólares: AL30 (pesos), AL30D (dólar MEP), AL30C (dólar cable).
-- Los precios de bonos suelen estar expresados cada 100 de valor nominal.
+- Tipos válidos: ACCIONES, BONOS, LETRAS, ON, CEDEARS, ETF, ACCIONES-USA, OPCIONES,
+  FUTUROS, CAUCIONES, FCI, FCI-EXTERIOR, LICITACIONES, NOBAC, LEBAC.
+- Plazos válidos: INMEDIATA, A-24HS, A-48HS, A-72HS. Por defecto: {PLAZO_DEFAULT}.
+- Bonos y ONs en dólares tienen tres especies: AL30 (pesos), AL30D (dólar MEP), AL30C (dólar cable).
+  Los bonos cotizan cada 100 de valor nominal.
+- Si no sabés el tipo o el ticker exacto, usá `buscar_especie`.
 - Para varias especies a la vez usá `cotizaciones` en lugar de llamar `cotizacion` muchas veces.
+- `calcular_bono`: el precio va en la moneda de emisión. Para bonos u ONs en dólares,
+  pasá el precio en USD cada 100 VN (el de la especie D o C), nunca el precio en pesos.
+- Fuera del horario de mercado y en fines de semana, `puntas` puede venir vacío o con error;
+  los precios son los del último cierre.
 """
 
 T = TypeVar("T")
@@ -126,7 +133,10 @@ async def cotizaciones(especies: list[Especie]) -> dict[str, Any]:
 
 @mcp.tool(annotations=SOLO_LECTURA)
 async def puntas(ticker: str, tipo: str = "ACCIONES", plazo: str = PLAZO_DEFAULT) -> dict[str, Any]:
-    """Libro de órdenes (puntas compradoras y vendedoras) de una especie en PPI."""
+    """Libro de órdenes (puntas compradoras y vendedoras) de una especie en PPI.
+
+    Solo tiene datos en horario de mercado; fuera de horario puede venir vacío o con error.
+    """
     t, ti, pl = _norm(ticker), _norm(tipo), _norm(plazo)
     datos = await _llamar(ppi().puntas(t, ti, pl))
     return {"ticker": t, "tipo": ti, "plazo": pl, "datos": datos}
@@ -185,7 +195,18 @@ async def buscar_especie(ticker: str = "", nombre: str = "", tipo: str = "", mer
     datos = await _llamar(
         ppi().buscar_especie(_norm(ticker), nombre.strip(), mercado.strip(), _norm(tipo) if tipo else "")
     )
-    return {"resultados": datos}
+    total = len(datos) if isinstance(datos, list) else None
+    recortado = total is not None and total > MAX_RESULTADOS_BUSQUEDA
+    return {
+        "total": total,
+        "aviso": (
+            f"Hay {total} resultados; se muestran los primeros {MAX_RESULTADOS_BUSQUEDA}. "
+            "Afiná la búsqueda con ticker o tipo."
+        )
+        if recortado
+        else None,
+        "resultados": datos[:MAX_RESULTADOS_BUSQUEDA] if recortado else datos,
+    }
 
 
 @mcp.tool(annotations=SOLO_LECTURA)
@@ -246,18 +267,49 @@ async def calcular_bono(
 ) -> dict[str, Any]:
     """Calculadora de bonos de PPI: TIR, duration, paridad, flujo de fondos, etc. a un precio dado.
 
+    IMPORTANTE: el precio va en la moneda de emisión del bono, cada 100 VN.
+    Para bonos u ONs en dólares (AL30, GD30, ONs en USD) usá el precio en dólares
+    de la especie D (MEP) o C (cable), p. ej. el de AL30D. NUNCA el precio en pesos:
+    da una TIR sin sentido.
+
     Args:
-        ticker: Ticker del bono (p. ej. AL30, GD30D, una ON).
-        precio: Precio a evaluar, en la misma moneda y base que cotiza la especie.
+        ticker: Ticker base del bono (p. ej. AL30, GD30, o el de una ON).
+        precio: Precio cada 100 VN en la moneda de emisión (ver arriba).
         cantidad: Cantidad de títulos (valor nominal) a evaluar.
         fecha: Fecha de liquidación (AAAA-MM-DD). Por defecto, hoy.
-        tipo_cantidad: Tipo de cantidad de PPI; ver `valores_validos` si "PAPELES" no es aceptado.
+        tipo_cantidad: PAPELES (por defecto), DINERO o CANTIDAD-TOTAL.
     """
     fecha = fecha or date.today()
     datos = await _llamar(
         ppi().estimar_bono(_norm(ticker), fecha, precio, _norm(tipo_cantidad), cantidad=cantidad)
     )
-    return {"ticker": _norm(ticker), "precio": precio, "fecha": fecha.isoformat(), "datos": datos}
+
+    resumen: dict[str, Any] | None = None
+    aviso: str | None = None
+    if isinstance(datos, dict):
+        tir, md, paridad = datos.get("tir"), datos.get("md"), datos.get("parity")
+        resumen = {
+            "tir_pct": round(tir * 100, 2) if isinstance(tir, (int, float)) else None,
+            "duration_modificada": round(md, 2) if isinstance(md, (int, float)) else None,
+            "paridad_pct": round(paridad * 100, 2) if isinstance(paridad, (int, float)) else None,
+            "moneda": datos.get("currency"),
+            "titulo": datos.get("title"),
+        }
+        if isinstance(tir, (int, float)) and not -0.5 < tir < 1.5:
+            aviso = (
+                f"La TIR da {tir * 100:.1f}%, un valor sin sentido. Casi seguro el precio está en otra "
+                f"moneda o base: este bono se calcula en {datos.get('currency') or 'su moneda de emisión'}. "
+                "Para bonos en dólares usá el precio en USD cada 100 VN (especie D o C), no el precio en pesos."
+            )
+
+    return {
+        "ticker": _norm(ticker),
+        "precio": precio,
+        "fecha": fecha.isoformat(),
+        "aviso": aviso,
+        "resumen": resumen,
+        "datos": datos,
+    }
 
 
 @mcp.tool(annotations=SOLO_LECTURA)
